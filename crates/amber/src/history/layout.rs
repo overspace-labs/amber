@@ -93,15 +93,21 @@ pub const SERVICE: [(u8, u16); 7] = [
     (6, 55),
 ];
 pub const HOST_WRAPPER: [(u8, u16); 2] = [(0, 10), (1, 18)];
+pub const TEXT_WRAPPER: [(u8, u16); 2] = [(0, 10), (1, 18)];
 pub const COMMENT_WRAPPER: [(u8, u16); 2] = [(1, 10), (2, 18)];
 pub const COMMENT_CHUNK: [(u8, u16); 3] = [(1, 13), (2, 21), (3, 25)];
 
 pub mod tag {
     pub const ENTRY_ID: u8 = 0;
+    pub const METHOD: u8 = 1;
     pub const REQUEST_METADATA: u8 = 2;
+    pub const EXTENSION: u8 = 3;
+    pub const IP: u8 = 4;
     pub const STATUS_CODE: u8 = 6;
     pub const MIME_CODE: u8 = 7;
     pub const RESPONSE_LENGTH: u8 = 8;
+    pub const TITLE: u8 = 9;
+    pub const COOKIES: u8 = 10;
     pub const TIME_EPOCH_MS: u8 = 11;
     pub const HIGHLIGHT: u8 = 13;
     pub const LISTENER_PORT: u8 = 14;
@@ -120,4 +126,15 @@ pub const ROW_TAG26: u64 = 0xFF;
 pub const SERVICE_TAG3: u64 = 4;
 pub const SERVICE_TAG6: u64 = 8_123_178_716_164_521_984;
 pub const METADATA_SENTINEL: u64 = 0xFFFF_FFFF;
-pub const RESPONSE_MIME_CODE: u64 = 257;
+// MIME type codes stored in row tag 7: 0x0100 + type index, where the index is
+// the montoya MimeType ordinal minus 3 (NONE/UNRECOGNIZED/AMBIGUOUS at 0..2
+// never appear in files). HTML(3)=256, PLAIN_TEXT(4)=257, CSS(5)=258,
+// SCRIPT(6)=259, JSON(7)=260, XML(9)=262. 256/257/260 verified against real
+// Burp rows; BurpSuite displays 258 as CSS (user-tested), so SCRIPT is 259 and
+// XML is 262, NOT 0x0103.
+pub const MIME_HTML: u64 = 0x0100;
+pub const MIME_TEXT: u64 = 0x0101;
+pub const MIME_CSS: u64 = 0x0102;
+pub const MIME_SCRIPT: u64 = 0x0103;
+pub const MIME_JSON: u64 = 0x0104;
+pub const MIME_XML: u64 = 0x0106;

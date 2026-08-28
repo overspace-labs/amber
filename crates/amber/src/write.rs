@@ -48,7 +48,13 @@ fn build(
     let staged = staging_path(destination);
     let result = (|| {
         seed(&staged)?;
-        let summary = apply(&staged, entries)?;
+        // Physical row count, used for the reported existing/total counts and the
+        // decode verification below. It can differ from the recorded history
+        // total (the ID high-water mark): real Burp projects with deleted rows
+        // keep the high-water mark while the physical rows are fewer.
+        let existing = u64::try_from(Project::open(&staged)?.len())
+            .map_err(|_| Error::OffsetOverflow)?;
+        let summary = apply(&staged, entries, existing)?;
         let project = Project::open(&staged)?;
         if project.len() as u64 != summary.total_entries {
             return Err(Error::Malformed(format!(
@@ -105,14 +111,17 @@ pub fn create(
     })
 }
 
-fn apply(project: &Path, entries: &[Entry]) -> Result<WriteSummary> {
+fn apply(project: &Path, entries: &[Entry], existing: u64) -> Result<WriteSummary> {
     let source = crate::binary::FileSource::open_read_write(project)?;
     let mut writer = Writer::open(&source)?;
     let mut history = History::open(&source)?;
-    let existing = u64::from(history.total());
+    // New entry ids derive from the recorded history total (the ID high-water
+    // mark, so deleted entries do not get their ids reused), while the reported
+    // existing/total counts use the physical row count passed by the caller.
+    let last_id = u64::from(history.total());
 
     for (index, entry) in entries.iter().enumerate() {
-        let entry_id = entry.entry_id.unwrap_or(existing + index as u64 + 1);
+        let entry_id = entry.entry_id.unwrap_or(last_id + index as u64 + 1);
         let row = write_entry(&mut writer, entry, entry_id)?;
         history.record(&mut writer, &source, row)?;
     }

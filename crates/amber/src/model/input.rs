@@ -25,6 +25,8 @@ pub struct InputDefaults {
     pub comment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub highlight: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,8 @@ pub struct HistoryInputEntry {
     pub comment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub highlight: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,5 +99,13 @@ impl HistoryInput {
             .as_deref()
             .or(self.defaults.highlight.as_deref())
             .filter(|value| !value.is_empty())
+    }
+
+    pub fn resolved_ip<'a>(&'a self, entry: &'a HistoryInputEntry) -> &'a str {
+        entry
+            .ip
+            .as_deref()
+            .or(self.defaults.ip.as_deref())
+            .unwrap_or("")
     }
 }

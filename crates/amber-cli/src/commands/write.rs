@@ -81,6 +81,7 @@ fn example() -> HistoryInput {
             listener_port: Some(DEFAULT_LISTENER_PORT),
             comment: None,
             highlight: None,
+            ip: None,
         },
         entries: vec![
             HistoryInputEntry {
@@ -100,6 +101,7 @@ fn example() -> HistoryInput {
                 listener_port: None,
                 comment: None,
                 highlight: None,
+                ip: None,
             },
             HistoryInputEntry {
                 url: "http://127.0.0.1:8080/health".to_owned(),
@@ -113,6 +115,7 @@ fn example() -> HistoryInput {
                 listener_port: None,
                 comment: Some("request-only entry".to_owned()),
                 highlight: Some("orange".to_owned()),
+                ip: None,
             },
         ],
     }
