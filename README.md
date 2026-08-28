@@ -56,6 +56,12 @@ Input documents look like this. `request` and `response` are either `{"path": ".
 at a file of raw bytes, or `{"base64": "..."}` inline. Everything except `url` and `request`
 is optional, and `defaults` supplies values for entries that omit them.
 
+Per-entry optional fields: `entry_id` (otherwise auto-assigned), `time_epoch_ms`,
+`listener_port`, `comment`, `highlight`, and `ip` — the resolved target server IP, written
+verbatim as the row's tag-4 text record without any format validation. When omitted, tag 4
+is not written (0), matching how Burp stores an entry whose server address was never
+resolved. Precedence is entry field > `defaults` > built-in default.
+
 ```json
 {
   "schema_version": 1,
@@ -64,7 +70,8 @@ is optional, and `defaults` supplies values for entries that omit them.
     {
       "url": "https://example.com/login",
       "request": { "path": "login.request.bin" },
-      "response": { "path": "login.response.bin" }
+      "response": { "path": "login.response.bin" },
+      "ip": "93.184.216.34"
     },
     {
       "url": "http://127.0.0.1:8080/health",

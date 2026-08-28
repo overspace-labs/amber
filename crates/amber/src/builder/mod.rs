@@ -1,5 +1,6 @@
 pub mod empty;
 pub mod encode;
+pub mod fields;
 pub mod input;
 pub mod skeleton;
 
@@ -254,6 +255,83 @@ fn write_comment(writer: &mut Writer<'_>, comment: &str) -> Result<u64> {
     )?)
 }
 
+// writeTextRecord writes a row-level text record for one of Burp's Method /
+// target-IP / Title / Extension / Cookies columns (row tags 1, 4, 9, 3 and
+// 10): the UTF-16BE text frame followed by its TextWrapper standard record. It
+// returns the wrapper record's offset, or 0 when value is empty (a row with no
+// <title> has tag 9 == 0, and a row with no target IP has tag 4 == 0), so no
+// empty text frame is ever written.
+fn write_text_record(writer: &mut Writer<'_>, value: &[u8]) -> Result<u64> {
+    if value.is_empty() {
+        return Ok(0);
+    }
+    let units = u32::try_from(fields::utf16_count(value)).map_err(|_| Error::OffsetOverflow)?;
+    let mut frame = Vec::with_capacity(8 + units as usize * 2);
+    frame.extend_from_slice(&(8 + units * 2).to_be_bytes());
+    frame.extend_from_slice(&units.to_be_bytes());
+    frame.extend_from_slice(&fields::utf16be_bytes(value));
+    let frame_offset = writer.write(&frame)?;
+    writer.write(&standard(
+        &layout::TEXT_WRAPPER,
+        &[
+            Field::new(0, frame_offset, 8),
+            Field::new(1, frame.len() as u64, 8),
+        ],
+    )?)
+}
+
+// writeUrlCache writes one row's URL/display cache (RequestMetadata field 1):
+// a path block `[u32 8+path_len][u32 path_len][ASCII path, padded to even]`
+// followed by ordered TextWrappers for extension, host, title and cookies. Each
+// wrapper points at a standard TextFrame whose frame_length u32 doubles as the
+// low 4 bytes of the wrapper's second field (real Burp rows lay the frame out
+// starting at wrapper+22, and its capacity u32 and UTF-16BE payload follow).
+// The block's leading total is 8+path_len even though the pad byte is still
+// written, matching real Burp rows byte for byte. Empty values are skipped
+// entirely, so no empty text frame is ever written. It returns the cache's
+// offset.
+fn write_url_cache(
+    writer: &mut Writer<'_>,
+    path: &[u8],
+    extension: &[u8],
+    host: &str,
+    title: &[u8],
+    cookies: &[u8],
+) -> Result<u64> {
+    let even = (path.len() + 1) & !1;
+    let mut blob = Vec::with_capacity(8 + even);
+    blob.extend_from_slice(&(8 + path.len() as u32).to_be_bytes());
+    blob.extend_from_slice(&(path.len() as u32).to_be_bytes());
+    blob.extend_from_slice(path);
+    blob.resize(8 + even, 0);
+    let offset = writer.write(&blob)?;
+
+    for value in [extension, host.as_bytes(), title, cookies] {
+        if value.is_empty() {
+            continue;
+        }
+        let units = u32::try_from(fields::utf16_count(value)).map_err(|_| Error::OffsetOverflow)?;
+        let mut wrapper = standard(
+            &layout::TEXT_WRAPPER,
+            &[
+                Field::new(0, 0, 8), // patched below with the frame offset
+                Field::new(1, 8 + units as u64 * 2, 8),
+            ],
+        )?;
+        // field 0 points at the frame's frame_length u32, which is the wrapper's
+        // low 4 bytes (the record is 26 bytes, so wrapper+22); the capacity u32
+        // and payload follow immediately.
+        let frame_offset = writer.mark() + wrapper.len() as u64 - 4;
+        wrapper[10..18].copy_from_slice(&frame_offset.to_be_bytes());
+        let mut item = Vec::with_capacity(wrapper.len() + 4 + units as usize * 2);
+        item.extend_from_slice(&wrapper);
+        item.extend_from_slice(&units.to_be_bytes());
+        item.extend_from_slice(&fields::utf16be_bytes(value));
+        writer.write(&item)?;
+    }
+    Ok(offset)
+}
+
 pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Result<u64> {
     let request = write_frame(writer, &entry.request)?;
     let response = match entry.response.as_deref() {
@@ -261,7 +339,50 @@ pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Res
         None => 0,
     };
 
-    let host_units = entry.host.encode_utf16().count() as u64;
+    // Row-level text records powering Burp's Method / target-IP / Title /
+    // Extension / Cookies columns (row tags 1, 4, 9, 3 and 10). A missing IP,
+    // title, extension or cookie writes 0 (no record at all), matching a real
+    // Burp row with no such value. The title and cookie text is derived here so
+    // the URL/display cache below can reuse the exact same bytes.
+    let method = write_text_record(writer, fields::request_method(&entry.request))?;
+    let ip = write_text_record(writer, entry.ip.as_bytes())?;
+    let title_text: Vec<u8> = entry
+        .response
+        .as_deref()
+        .map(fields::extract_title)
+        .unwrap_or_default();
+    let title = write_text_record(writer, &title_text)?;
+
+    // The URL/display cache and the Extension/Cookies tags all derive from the
+    // request path and headers. The path is the origin-form request target with
+    // any query stripped, matching what real Burp rows store in the cache.
+    let target = fields::request_target(&entry.request);
+    let path = match target.iter().position(|byte| *byte == b'?') {
+        Some(query) => &target[..query],
+        None => target,
+    };
+    let path = if path.is_empty() { b"/".as_slice() } else { path };
+    let extension_name = fields::url_extension(path);
+    let extension = write_text_record(writer, extension_name)?;
+    let cookie_name: &[u8] = entry
+        .response
+        .as_deref()
+        .map(fields::cookie_value)
+        .unwrap_or(&[]);
+    let cookies = write_text_record(writer, cookie_name)?;
+    let url_cache = write_url_cache(
+        writer,
+        path,
+        extension_name,
+        &entry.host,
+        &title_text,
+        cookie_name,
+    )?;
+    // Real Burp rows set RequestMetadata field 5 to the cache's leading total
+    // (8 + path length, not the padded block size); it is verified equal across
+    // every real row sampled.
+    let cache_total = 8 + path.len() as u64;
+
     let host_text = text(&entry.host)?;
     let host_length = host_text.len() as u64;
     let host_offset = writer.write(&host_text)?;
@@ -288,11 +409,11 @@ pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Res
         &layout::REQUEST_METADATA,
         &[
             Field::new(0, service, 8),
-            Field::new(1, 0, 8),
+            Field::new(1, url_cache, 8),
             Field::new(2, layout::METADATA_SENTINEL, 4),
             Field::new(3, layout::METADATA_SENTINEL, 4),
             Field::new(4, 0, 8),
-            Field::new(5, host_units, 8),
+            Field::new(5, cache_total, 8),
         ],
     )?)?;
 
@@ -303,21 +424,20 @@ pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Res
         _ => 0,
     };
     let response_length = entry.response.as_ref().map_or(0, Vec::len) as u64;
+    let mime = fields::mime_code(entry.response.as_deref().unwrap_or(&[]));
 
     let values = [
         (127, layout::ROW_MAGIC),
         (tag::ENTRY_ID, entry_id),
+        (tag::METHOD, method),
         (tag::REQUEST_METADATA, metadata),
+        (tag::EXTENSION, extension),
+        (tag::IP, ip),
         (tag::STATUS_CODE, u64::from(entry.status)),
-        (
-            tag::MIME_CODE,
-            if entry.response.is_some() {
-                layout::RESPONSE_MIME_CODE
-            } else {
-                0
-            },
-        ),
+        (tag::MIME_CODE, mime),
         (tag::RESPONSE_LENGTH, response_length),
+        (tag::TITLE, title),
+        (tag::COOKIES, cookies),
         (tag::TIME_EPOCH_MS, entry.time_epoch_ms),
         (tag::HIGHLIGHT, highlight),
         (tag::LISTENER_PORT, u64::from(entry.listener_port)),
@@ -329,7 +449,7 @@ pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Res
         (tag::COMMENT_WRAPPER, comment),
         (tag::SECONDARY_TIME, entry.time_epoch_ms),
     ];
-    let fields: Vec<Field> = layout::ROW_WIDTHS
+    let row_fields: Vec<Field> = layout::ROW_WIDTHS
         .iter()
         .map(|(tag, width)| {
             let value = values
@@ -340,5 +460,5 @@ pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Res
         })
         .collect();
 
-    writer.write(&typed(layout::ROW_TYPE_ID, &layout::ROW, &fields)?)
+    writer.write(&typed(layout::ROW_TYPE_ID, &layout::ROW, &row_fields)?)
 }
