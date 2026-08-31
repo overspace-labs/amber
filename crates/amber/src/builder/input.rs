@@ -72,9 +72,6 @@ fn prepare(
 
     let request = blob(&entry.request, base)?;
     check_request(&request)?;
-    // Burp Proxy history stores origin-form HTTP/1.x; normalize the captured
-    // text (mitmproxy's HTTP/2 assembly yields absolute-form HTTP/2.0 with no
-    // Host header). Well-formed requests are returned byte-for-byte unchanged.
     let request = normalize_request(&request, &host, port, tls);
     let response = entry
         .response
@@ -182,17 +179,13 @@ fn status_code(response: &[u8]) -> Result<u16> {
         .ok_or_else(|| Error::Malformed("raw response status code is not a number".to_owned()))
 }
 
-// normalizeRequest rewrites a captured request into the origin-form HTTP/1.x
-// shape Burp Suite stores in Proxy history. mitmproxy's HTTP/2 text assembly
-// yields an absolute-form target, an "HTTP/2.0" version line and no Host
-// header; the canonical Burp form is "METHOD /path HTTP/1.1" plus a Host
-// header. A request that is already well-formed comes back byte-for-byte
-// unchanged, so existing round-trips are unaffected.
 fn normalize_request(request: &[u8], host: &str, port: u16, tls: bool) -> Vec<u8> {
     let Some(line_end) = memchr::memmem::find(request, b"\r\n") else {
         return request.to_vec();
     };
-    let parts: Vec<&[u8]> = request[..line_end].splitn(3, |byte| *byte == b' ').collect();
+    let parts: Vec<&[u8]> = request[..line_end]
+        .splitn(3, |byte| *byte == b' ')
+        .collect();
     if parts.len() != 3 {
         return request.to_vec();
     }
@@ -205,21 +198,20 @@ fn normalize_request(request: &[u8], host: &str, port: u16, tls: bool) -> Vec<u8
     }
     let target = parts[1];
     let mut new_target = target.to_vec();
-    if target.starts_with(b"http://") || target.starts_with(b"https://") {
-        if let Ok(text) = std::str::from_utf8(target)
-            && let Ok(parsed) = Url::parse(text)
-        {
-            let mut uri = parsed.path().to_owned();
-            if uri.is_empty() {
-                uri.push('/');
-            }
-            if let Some(query) = parsed.query() {
-                uri.push('?');
-                uri.push_str(query);
-            }
-            new_target = uri.into_bytes();
-            changed = true;
+    if (target.starts_with(b"http://") || target.starts_with(b"https://"))
+        && let Ok(text) = std::str::from_utf8(target)
+        && let Ok(parsed) = Url::parse(text)
+    {
+        let mut uri = parsed.path().to_owned();
+        if uri.is_empty() {
+            uri.push('/');
         }
+        if let Some(query) = parsed.query() {
+            uri.push('?');
+            uri.push_str(query);
+        }
+        new_target = uri.into_bytes();
+        changed = true;
     }
 
     let (kept, has_host, body, dropped) = scan_headers(request, line_end, true);
@@ -254,11 +246,6 @@ fn normalize_request(request: &[u8], host: &str, port: u16, tls: bool) -> Vec<u8
     out
 }
 
-// canonical_version maps an HTTP version token to the form Burp Suite stores.
-// HTTP/1.x tokens pass through unchanged; a spurious minor version on HTTP/2 or
-// HTTP/3 ("HTTP/2.0") collapses to the major-only token, and anything
-// unrecognized falls back to HTTP/1.1. The second return reports whether the
-// token was rewritten.
 fn canonical_version(version: &[u8]) -> (Vec<u8>, bool) {
     if version == b"HTTP/1.1" || version == b"HTTP/1.0" {
         return (version.to_vec(), false);
@@ -272,11 +259,6 @@ fn canonical_version(version: &[u8]) -> (Vec<u8>, bool) {
     (b"HTTP/1.1".to_vec(), true)
 }
 
-// normalize_response canonicalizes a response status line and drops any HTTP/2
-// pseudo-headers, mirroring normalize_request. Real Burp Suite keeps the major
-// version marker for HTTP/2 responses, so "HTTP/2.0" becomes "HTTP/2" (and
-// "HTTP/3.0" becomes "HTTP/3"); HTTP/1.x lines and already-canonical responses
-// come back unchanged.
 fn normalize_response(response: &[u8]) -> Vec<u8> {
     let Some(line_end) = memchr::memmem::find(response, b"\r\n") else {
         return response.to_vec();
@@ -316,15 +298,11 @@ fn normalize_response(response: &[u8]) -> Vec<u8> {
     out
 }
 
-// scan_headers walks the header block that starts at line_end+2, collecting
-// every header line (HTTP/2 pseudo-headers starting with ':' are dropped) and
-// the message body. When want_host is set it reports whether a Host header was
-// seen.
-fn scan_headers<'a>(
-    message: &'a [u8],
+fn scan_headers(
+    message: &[u8],
     line_end: usize,
     want_host: bool,
-) -> (Vec<&'a [u8]>, bool, &'a [u8], bool) {
+) -> (Vec<&[u8]>, bool, &[u8], bool) {
     let mut kept = Vec::new();
     let mut has_host = false;
     let mut dropped = false;
@@ -359,8 +337,6 @@ fn scan_headers<'a>(
     (kept, has_host, body, dropped)
 }
 
-// authority renders the Host header value, omitting the default port for the
-// scheme.
 fn authority(host: &str, port: u16, tls: bool) -> String {
     if (tls && port == 443) || (!tls && port == 80) {
         host.to_owned()

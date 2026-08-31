@@ -68,9 +68,6 @@ impl FileSource {
         Ok(())
     }
 
-    /// Positioned reads and writes are platform extensions in std, so this drives the shared
-    /// cursor instead. `FileSource` is `!Sync`, so nothing else can move it; remembering where
-    /// it landed lets sequential access skip the seek and cost the same one syscall as `pread`.
     fn seek(&self, offset: u64) -> Result<()> {
         if self.cursor.replace(None) != Some(offset) {
             (&self.file).seek(SeekFrom::Start(offset))?;
