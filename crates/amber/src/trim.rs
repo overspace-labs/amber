@@ -25,6 +25,7 @@ use crate::history::layout::tag;
 use crate::model::history::{HistoryEntry, highlight_code};
 use crate::write::{guard, staging_path};
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct TrimOptions {
     pub force: bool,

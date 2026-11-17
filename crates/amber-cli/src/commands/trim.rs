@@ -8,6 +8,7 @@ use serde_json::json;
 
 use super::{DedupeArg, FilterArgs, human_bytes};
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 pub struct TrimCommand {
     /// Source Burp project; it is opened read-only and never modified.
