@@ -93,3 +93,86 @@ pass `-f, --force`. Generated projects get freshly minted ids so two runs never 
   projects `create` and `append` will refuse.
 - `create` builds on an embedded model of an empty project, so generated projects carry Burp's
   default configuration.
+
+## Burp-tool additions (local fork)
+
+This fork (branch `burp-tool`) builds on Rust 1.85 and adds scope filtering, de-duplication,
+content search and a streaming trim. `list`, `show`, `search`, `hosts` and `trim` skip the
+whole-file SHA-256 (`export` still records it), so a multi-gigabyte project costs one read.
+
+### Scope filters (every command that takes filters)
+
+| flag | matches |
+| --- | --- |
+| `--scope-host PATTERN` | `example.com` = the host and all subdomains; `*.example.com` is the same; `*` globs (`noise*.example.com`); a leading `!` excludes. Repeatable. |
+| `--scope-file FILE` | one pattern per line, `#` comments, combined with `--scope-host` |
+
+A host is in scope when it matches an include pattern (or there are none) and no exclude.
+
+### Search, like Proxy > HTTP history > "Filter by search term"
+
+```sh
+amber search project.burp 'Bearer '                        # entries containing the term (case-insensitive)
+amber search project.burp 'idcs-[0-9a-f]{32}' -r -o        # print every match: ID <TAB> part <TAB> match
+amber search project.burp 'access_token":"([^"]+)' -r -g 1 -o -i res-body -d   # capture group, decoded bodies
+amber search project.burp password -i req-body -X POST --scope-file scope.txt -x 60   # show 60 bytes of context
+amber search project.burp csrf -v -i req-headers -X POST   # negative search: POSTs WITHOUT the term
+amber show project.burp 1234 --raw response > resp.bin     # the raw message, like Burp's message editor
+```
+
+| Burp search option | amber |
+| --- | --- |
+| Regex | `-r, --regex` |
+| Case sensitive | `-C, --case-sensitive` |
+| Negative search | `-v, --negate` |
+| Search in request / response headers / body | `-i, --in req,res,req-headers,req-body,res-headers,res-body` |
+| Show only in-scope items | `--scope-file` / `--scope-host` |
+| Filter by MIME / status / method / annotation | `-m`, `-s`, `-X`, `-c`, `-l` |
+
+`-d, --decode` undoes chunked transfer coding and gzip/deflate/br before matching (Burp's search
+matches the stored bytes, so it is off by default). `-F jsonl` gives one JSON object per entry
+with match samples; `-n` stops after N matching entries.
+
+### Hosts
+
+```sh
+amber hosts project.burp                                  # entries, duplicates and bytes per host, largest first
+amber hosts project.burp --scope-file scope.txt -F jsonl
+```
+
+### Trim
+
+```sh
+amber trim project.burp --scope-file scope.txt --dry-run --manifest plan.jsonl
+amber trim project.burp --scope-file scope.txt -o trimmed.burp --manifest trimmed.manifest.jsonl --verify
+```
+
+Writes a **new** project holding only the Proxy history entries that pass the filters and are not
+duplicates. The source is opened read-only. Requests and responses are copied byte for byte (an
+`HTTP/2` request line stays `HTTP/2`), together with the original entry ID, time, listener port,
+comment, highlight and server IP. Entries go in one at a time, so memory use does not grow
+with project size. `--verify` re-reads the output and compares every kept message's sha256 with
+the source. The manifest has one JSON line per source entry: `kept`, `filtered`,
+`duplicate` (with `of`, the kept entry it repeats) or `unwritable` (with `reason`).
+
+`--dedupe` (default `session`). Entries with a comment or highlight are always kept, and the
+lowest entry ID of a group is the one kept.
+
+| mode | an entry is a duplicate of an earlier one when these are identical |
+| --- | --- |
+| `session` | method, URL, request body, caller identity, status, response body |
+| `any` | method, URL, request body, status, response body |
+| `endpoint` | method, URL, request body |
+| `none` | never |
+
+Caller identity is made of two things:
+- **The `Authorization` value.** For OCI request signing (`Signature ... keyId=`), only the key id
+  counts.
+- **The cookies, sorted.** Analytics and bot-management cookies (`_ga*`, `s_*`, `AMCV_*`, `bm_*`,
+  `_abck`, ...) are left out.
+
+Static assets (script, style, image, font, source map, judged by `Content-Type` or extension)
+leave identity out.
+
+The new project contains **Proxy history only**. Repeater, Site map, Scanner issues, Logger,
+Organizer and project settings stay in the original. Keep the original as the archive.
