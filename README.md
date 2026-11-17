@@ -129,6 +129,10 @@ amber show project.burp 1234 --raw response > resp.bin     # the raw message, li
 | Show only in-scope items | `--scope-file` / `--scope-host` |
 | Filter by MIME / status / method / annotation | `-m`, `-s`, `-X`, `-c`, `-l` |
 
+`-M, --mask` never prints a matched value: each one is shown as `eyJ4…[598 bytes #3d4c2231]`
+(prefix, length, sha256 fingerprint), so the same token can be tracked across entries without
+being revealed. It cannot be combined with `--context`.
+
 `-d, --decode` undoes chunked transfer coding and gzip/deflate/br before matching (Burp's search
 matches the stored bytes, so it is off by default). `-F jsonl` gives one JSON object per entry
 with match samples; `-n` stops after N matching entries.

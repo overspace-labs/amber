@@ -64,12 +64,33 @@ pub struct SearchCommand {
     #[arg(short = 'x', long, value_name = "BYTES")]
     pub context: Option<usize>,
     /// Stop after this many matching entries.
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, value_parser = clap::value_parser!(u64).range(1..))]
     pub limit: Option<u64>,
+    /// Never print matched values: show each as `<first 4 chars>…[N bytes #<sha256 prefix>]`
+    /// so equal secrets can be correlated across entries without being revealed. Cannot be
+    /// combined with --context (surrounding bytes could expose the value).
+    #[arg(short = 'M', long, conflicts_with = "context")]
+    pub mask: bool,
     #[arg(short = 'F', long, value_enum, default_value_t = Format::Table)]
     pub format: Format,
     #[command(flatten)]
     pub filters: FilterArgs,
+}
+
+/// A stable, non-reversible stand-in for a matched value.
+fn masked(value: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let fingerprint: String = Sha256::digest(value)
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let shown = if value.len() >= 12 {
+        printable(&value[..4])
+    } else {
+        String::new()
+    };
+    format!("{shown}…[{} bytes #{fingerprint}]", value.len())
 }
 
 fn snippet(text: &[u8], start: usize, end: usize, context: usize) -> String {
@@ -86,6 +107,10 @@ fn snippet(text: &[u8], start: usize, end: usize, context: usize) -> String {
 }
 
 impl SearchCommand {
+    fn render(&self, value: &[u8]) -> String {
+        if self.mask { masked(value) } else { printable(value) }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run(&self) -> Result<()> {
         let filter = self.filters.build()?;
@@ -160,7 +185,7 @@ impl SearchCommand {
                                 "{}\t{}\t{}",
                                 entry.entry_id,
                                 part.part.label(),
-                                printable(&part.text[*start..*end])
+                                self.render(&part.text[*start..*end])
                             )?,
                             Format::Jsonl => {
                                 serde_json::to_writer(
@@ -169,7 +194,7 @@ impl SearchCommand {
                                         "entry_id": entry.entry_id,
                                         "part": part.part,
                                         "offset": start,
-                                        "match": String::from_utf8_lossy(&part.text[*start..*end]),
+                                        "match": self.render(&part.text[*start..*end]),
                                     }),
                                 )?;
                                 out.write_all(b"\n")?;
@@ -228,8 +253,8 @@ impl SearchCommand {
                                 "decoded": part.decoded,
                                 "samples": part.ranges.iter().take(20).map(|(start, end)| json!({
                                     "offset": start,
-                                    "match": String::from_utf8_lossy(&part.text[*start..*end]),
-                                    "context": snippet(&part.text, *start, *end, context),
+                                    "match": self.render(&part.text[*start..*end]),
+                                    "context": (!self.mask).then(|| snippet(&part.text, *start, *end, context)),
                                 })).collect::<Vec<_>>(),
                             })
                         })
@@ -265,5 +290,21 @@ impl SearchCommand {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::masked;
+
+    #[test]
+    fn mask_hides_value_but_is_stable() {
+        let token = b"eyJhbGciOiJSUzI1NiJ9.payload.sig";
+        let one = masked(token);
+        assert_eq!(one, masked(token));
+        assert!(one.starts_with("eyJh…["));
+        assert!(!one.contains("payload"));
+        assert_ne!(one, masked(b"eyJhbGciOiJSUzI1NiJ9.other.sig"));
+        assert!(!masked(b"hunter2").contains("hunt"));
     }
 }
