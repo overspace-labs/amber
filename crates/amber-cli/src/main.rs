@@ -2,7 +2,10 @@ mod commands;
 
 use clap::{Parser, Subcommand};
 
-use commands::{AppendCommand, CreateCommand, ExportCommand, ListCommand, ShowCommand};
+use commands::{
+    AppendCommand, CreateCommand, ExportCommand, HostsCommand, ListCommand, SearchCommand,
+    ShowCommand, TrimCommand,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,6 +31,12 @@ enum Command {
     List(ListCommand),
     /// Show one Proxy HTTP history entry by its stable ID.
     Show(ShowCommand),
+    /// Search request/response content, like Burp's Proxy history search.
+    Search(SearchCommand),
+    /// Per-host entry counts, message bytes and duplicates.
+    Hosts(HostsCommand),
+    /// Write a new project holding only the filtered, de-duplicated Proxy history.
+    Trim(TrimCommand),
     /// Synthesize a whole project from JSON entries, with no source project.
     Create(CreateCommand),
     /// Append JSON entries to a copy of an existing project, preserving everything already stored.
@@ -40,6 +49,9 @@ fn main() -> std::process::ExitCode {
         Command::Export(command) => command.run(),
         Command::List(command) => command.run(),
         Command::Show(command) => command.run(),
+        Command::Search(command) => command.run(),
+        Command::Hosts(command) => command.run(),
+        Command::Trim(command) => command.run(),
         Command::Create(command) => command.run(),
         Command::Append(command) => command.run(),
     };

@@ -86,10 +86,10 @@ fn prepare(
         .unwrap_or(0);
     let defaults = document.resolved_defaults(ordinal, entry);
     let highlight = document.resolved_highlight(entry);
-    if let Some(name) = highlight
-        && highlight_code(name).is_none()
-    {
-        return Err(Error::Malformed(format!("unknown highlight colour {name}")));
+    if let Some(name) = highlight {
+        if highlight_code(name).is_none() {
+            return Err(Error::Malformed(format!("unknown highlight colour {name}")));
+        }
     }
 
     Ok(Entry {
@@ -198,10 +198,11 @@ fn normalize_request(request: &[u8], host: &str, port: u16, tls: bool) -> Vec<u8
     }
     let target = parts[1];
     let mut new_target = target.to_vec();
-    if (target.starts_with(b"http://") || target.starts_with(b"https://"))
-        && let Ok(text) = std::str::from_utf8(target)
-        && let Ok(parsed) = Url::parse(text)
-    {
+    let absolute = (target.starts_with(b"http://") || target.starts_with(b"https://"))
+        .then(|| std::str::from_utf8(target).ok())
+        .flatten()
+        .and_then(|text| Url::parse(text).ok());
+    if let Some(parsed) = absolute {
         let mut uri = parsed.path().to_owned();
         if uri.is_empty() {
             uri.push('/');

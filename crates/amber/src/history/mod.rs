@@ -25,22 +25,29 @@ pub struct StreamSummary {
 pub struct Project {
     path: PathBuf,
     source: FileSource,
-    sha256: String,
+    sha256: Option<String>,
     header: [u8; 8],
     rows: Vec<(u64, u64)>,
 }
 
 impl Project {
+    /// Opens a project and hashes the whole file, so `info()` carries its sha256.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::from_source(path, FileSource::open(path)?)
+        Self::from_source(path, FileSource::open(path)?, true)
+    }
+
+    /// Opens a project without hashing the whole file. The row scan still reads every byte
+    /// once, but skipping SHA-256 roughly halves the cost on multi-gigabyte projects.
+    pub fn open_fast(path: &Path) -> Result<Self> {
+        Self::from_source(path, FileSource::open(path)?, false)
     }
 
     pub fn open_read_write(path: &Path) -> Result<Self> {
-        Self::from_source(path, FileSource::open_read_write(path)?)
+        Self::from_source(path, FileSource::open_read_write(path)?, true)
     }
 
-    fn from_source(path: &Path, source: FileSource) -> Result<Self> {
-        let (sha256, offsets) = scan(&source)?;
+    fn from_source(path: &Path, source: FileSource, hash: bool) -> Result<Self> {
+        let (sha256, offsets) = scan(&source, hash)?;
         let mut header = [0u8; 8];
         if source.len() >= 8 {
             source.read_into_at(0, &mut header)?;
@@ -140,13 +147,19 @@ impl Project {
         })
     }
 
-    pub fn require_complete(&self) -> Result<()> {
+    /// Fails when two Proxy rows carry the same entry id.
+    pub fn require_unique_ids(&self) -> Result<()> {
         if let Some(pair) = self.rows.windows(2).find(|pair| pair[0].0 == pair[1].0) {
             return Err(Error::Malformed(format!(
                 "entry id {} is used by rows at {} and {}",
                 pair[0].0, pair[0].1, pair[1].1
             )));
         }
+        Ok(())
+    }
+
+    pub fn require_complete(&self) -> Result<()> {
+        self.require_unique_ids()?;
         let summary = self.for_each(&HistoryFilter::default(), |entry| {
             if entry.validation.is_complete() {
                 Ok(())
@@ -167,7 +180,7 @@ impl Project {
     }
 }
 
-fn scan(source: &FileSource) -> Result<(String, Vec<u64>)> {
+fn scan(source: &FileSource, hash: bool) -> Result<(Option<String>, Vec<u64>)> {
     let needle: &[u8] = &layout::ROW_HEADER;
     let finder = memchr::memmem::Finder::new(needle);
     let carry_length = needle.len() - 1;
@@ -181,7 +194,9 @@ fn scan(source: &FileSource) -> Result<(String, Vec<u64>)> {
         let amount = usize::try_from((source.len() - consumed).min(SCAN_CHUNK as u64))
             .map_err(|_| Error::OffsetOverflow)?;
         source.read_into_at(consumed, &mut buffer[carried..carried + amount])?;
-        hasher.update(&buffer[carried..carried + amount]);
+        if hash {
+            hasher.update(&buffer[carried..carried + amount]);
+        }
 
         let filled = carried + amount;
         let origin = consumed - carried as u64;
@@ -200,5 +215,5 @@ fn scan(source: &FileSource) -> Result<(String, Vec<u64>)> {
         carried = filled - tail;
         consumed += amount as u64;
     }
-    Ok((hex(&hasher.finalize()), offsets))
+    Ok((hash.then(|| hex(&hasher.finalize())), offsets))
 }

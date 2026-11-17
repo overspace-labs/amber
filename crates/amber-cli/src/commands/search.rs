@@ -1,0 +1,245 @@
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+
+use amber::{Matcher, Part, Project, Result, SearchOptions, search_entry};
+use clap::{Args, ValueEnum};
+use serde_json::json;
+
+use super::inspect::Format;
+use super::{FilterArgs, printable, warn_unknown_header};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PartArg {
+    /// Request headers and body.
+    Req,
+    /// Response headers and body.
+    Res,
+    ReqHeaders,
+    ReqBody,
+    ResHeaders,
+    ResBody,
+}
+
+impl PartArg {
+    fn parts(self) -> &'static [Part] {
+        match self {
+            Self::Req => &[Part::ReqHeaders, Part::ReqBody],
+            Self::Res => &[Part::ResHeaders, Part::ResBody],
+            Self::ReqHeaders => &[Part::ReqHeaders],
+            Self::ReqBody => &[Part::ReqBody],
+            Self::ResHeaders => &[Part::ResHeaders],
+            Self::ResBody => &[Part::ResBody],
+        }
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Args)]
+pub struct SearchCommand {
+    pub project: PathBuf,
+    /// Search term; a literal string unless --regex is given.
+    pub term: String,
+    /// Treat the term as a regular expression (Rust `regex` syntax).
+    #[arg(short, long)]
+    pub regex: bool,
+    /// Match case exactly (default is case-insensitive, like Burp).
+    #[arg(short = 'C', long)]
+    pub case_sensitive: bool,
+    /// List entries that do NOT match (Burp's "negative search").
+    #[arg(short = 'v', long)]
+    pub negate: bool,
+    /// Where to look, comma-separated; default is everywhere.
+    #[arg(short = 'i', long = "in", value_enum, value_delimiter = ',')]
+    pub parts: Vec<PartArg>,
+    /// Undo chunked transfer coding and gzip/deflate/br content coding before matching.
+    #[arg(short, long)]
+    pub decode: bool,
+    /// Print each match (`ID<TAB>PART<TAB>MATCH`) instead of one line per entry.
+    #[arg(short, long)]
+    pub only_matching: bool,
+    /// Report this regex capture group instead of the whole match (implies the group exists).
+    #[arg(short, long, value_name = "N")]
+    pub group: Option<usize>,
+    /// Under each entry, show every match with this many bytes of context either side.
+    #[arg(short = 'x', long, value_name = "BYTES")]
+    pub context: Option<usize>,
+    /// Stop after this many matching entries.
+    #[arg(short = 'n', long)]
+    pub limit: Option<u64>,
+    #[arg(short = 'F', long, value_enum, default_value_t = Format::Table)]
+    pub format: Format,
+    #[command(flatten)]
+    pub filters: FilterArgs,
+}
+
+fn snippet(text: &[u8], start: usize, end: usize, context: usize) -> String {
+    let from = start.saturating_sub(context);
+    let to = end.saturating_add(context).min(text.len());
+    format!(
+        "{}{}[{}]{}{}",
+        if from > 0 { "…" } else { "" },
+        printable(&text[from..start]),
+        printable(&text[start..end]),
+        printable(&text[end..to]),
+        if to < text.len() { "…" } else { "" },
+    )
+}
+
+impl SearchCommand {
+    #[allow(clippy::too_many_lines)]
+    pub fn run(&self) -> Result<()> {
+        let filter = self.filters.build()?;
+        filter.validate()?;
+        let matcher = Matcher::new(&self.term, self.regex, self.case_sensitive)?;
+        if let Some(group) = self.group {
+            if group >= matcher.regex().captures_len() {
+                return Err(amber::Error::Malformed(format!(
+                    "pattern has no capture group {group}"
+                )));
+            }
+        }
+        let options = SearchOptions {
+            parts: self
+                .parts
+                .iter()
+                .flat_map(|part| part.parts().iter().copied())
+                .collect(),
+            decode: self.decode,
+            group: self.group,
+        };
+        let project = Project::open_fast(&self.project)?;
+        warn_unknown_header(&project);
+
+        let mut out = BufWriter::new(std::io::stdout().lock());
+        if self.format == Format::Table && !self.only_matching {
+            writeln!(out, "{:>6}  {:<7}  {:>6}  {:<28}  URL", "ID", "METHOD", "STATUS", "MATCHES")?;
+        }
+        let mut hits = 0u64;
+        let mut scanned = 0u64;
+        let mut stopped = false;
+        let summary = project.for_each(&filter, |entry| {
+            if stopped {
+                return Ok(());
+            }
+            scanned += 1;
+            let found = search_entry(project.source(), &entry, &matcher, &options)?;
+            if found.is_empty() != self.negate {
+                return Ok(());
+            }
+            hits += 1;
+            if self.limit.is_some_and(|limit| hits >= limit) {
+                stopped = true;
+            }
+            let url = entry.request.url.as_deref().unwrap_or_default();
+            let method = entry.request.method.as_deref().unwrap_or_default();
+            let status = entry.status_code.unsigned;
+
+            if self.only_matching {
+                for part in &found {
+                    for (start, end) in &part.ranges {
+                        match self.format {
+                            Format::Table => writeln!(
+                                out,
+                                "{}\t{}\t{}",
+                                entry.entry_id,
+                                part.part.label(),
+                                printable(&part.text[*start..*end])
+                            )?,
+                            Format::Jsonl => {
+                                serde_json::to_writer(
+                                    &mut out,
+                                    &json!({
+                                        "entry_id": entry.entry_id,
+                                        "part": part.part,
+                                        "offset": start,
+                                        "match": String::from_utf8_lossy(&part.text[*start..*end]),
+                                    }),
+                                )?;
+                                out.write_all(b"\n")?;
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            match self.format {
+                Format::Table => {
+                    let labels: Vec<String> = found
+                        .iter()
+                        .map(|part| {
+                            format!(
+                                "{}:{}{}",
+                                part.part.label(),
+                                part.ranges.len(),
+                                if part.truncated { "+" } else { "" }
+                            )
+                        })
+                        .collect();
+                    writeln!(
+                        out,
+                        "{:>6}  {:<7}  {:>6}  {:<28}  {url}",
+                        entry.entry_id,
+                        method,
+                        status,
+                        if self.negate { "-".to_owned() } else { labels.join(",") },
+                    )?;
+                    if let Some(context) = self.context {
+                        for part in &found {
+                            for (start, end) in &part.ranges {
+                                writeln!(
+                                    out,
+                                    "        {}@{}{}: {}",
+                                    part.part.label(),
+                                    start,
+                                    if part.decoded { " (decoded)" } else { "" },
+                                    snippet(&part.text, *start, *end, context)
+                                )?;
+                            }
+                        }
+                    }
+                }
+                Format::Jsonl => {
+                    let context = self.context.unwrap_or(40);
+                    let parts_json: Vec<serde_json::Value> = found
+                        .iter()
+                        .map(|part| {
+                            json!({
+                                "part": part.part,
+                                "count": part.ranges.len(),
+                                "truncated": part.truncated,
+                                "decoded": part.decoded,
+                                "samples": part.ranges.iter().take(20).map(|(start, end)| json!({
+                                    "offset": start,
+                                    "match": String::from_utf8_lossy(&part.text[*start..*end]),
+                                    "context": snippet(&part.text, *start, *end, context),
+                                })).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                    serde_json::to_writer(
+                        &mut out,
+                        &json!({
+                            "entry_id": entry.entry_id,
+                            "method": method,
+                            "url": url,
+                            "status": status,
+                            "time_epoch_ms": entry.time_epoch_ms.unsigned,
+                            "comment": entry.comment.value,
+                            "matches": parts_json,
+                        }),
+                    )?;
+                    out.write_all(b"\n")?;
+                }
+            }
+            Ok(())
+        })?;
+        out.flush()?;
+        eprintln!(
+            "{hits} matching entries of {scanned} searched ({} in project){}",
+            summary.total,
+            if stopped { "; stopped at --limit" } else { "" }
+        );
+        Ok(())
+    }
+}

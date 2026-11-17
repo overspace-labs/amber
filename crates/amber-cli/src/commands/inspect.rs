@@ -42,7 +42,7 @@ impl ExportCommand {
             &ExportOptions {
                 write_blobs: !self.no_blobs,
                 force: self.destination.force,
-                filter: self.filters.build(),
+                filter: self.filters.build()?,
             },
         )?;
         if self.progress {
@@ -75,9 +75,9 @@ pub struct ListCommand {
 
 impl ListCommand {
     pub fn run(&self) -> Result<()> {
-        let filter = self.filters.build();
+        let filter = self.filters.build()?;
         filter.validate()?;
-        let project = Project::open(&self.project)?;
+        let project = Project::open_fast(&self.project)?;
         warn_unknown_header(&project);
 
         let stdout = std::io::stdout();
@@ -132,6 +132,12 @@ fn summarize(entry: &HistoryEntry) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RawPart {
+    Request,
+    Response,
+}
+
 #[derive(Debug, Args)]
 pub struct ShowCommand {
     pub project: PathBuf,
@@ -139,13 +145,32 @@ pub struct ShowCommand {
     pub entry_id: u64,
     #[arg(short = 'F', long, value_enum, default_value_t = EntryFormat::Human)]
     pub format: EntryFormat,
+    /// Write the raw request or response bytes to stdout instead of the entry summary.
+    #[arg(short, long, value_enum)]
+    pub raw: Option<RawPart>,
 }
 
 impl ShowCommand {
     pub fn run(&self) -> Result<()> {
-        let project = Project::open(&self.project)?;
+        let project = Project::open_fast(&self.project)?;
         warn_unknown_header(&project);
         let entry = project.entry(self.entry_id)?;
+        if let Some(part) = self.raw {
+            let message = match part {
+                RawPart::Request => Some(&entry.request),
+                RawPart::Response => entry.response.as_ref(),
+            };
+            let Some(message) = message else {
+                return Err(amber::Error::Malformed(format!(
+                    "entry {} has no response",
+                    entry.entry_id
+                )));
+            };
+            let bytes = amber::history::decode::message_bytes(project.source(), message)?;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&bytes)?;
+            return Ok(stdout.flush()?);
+        }
         match self.format {
             EntryFormat::Json => println!("{}", serde_json::to_string_pretty(&entry)?),
             EntryFormat::Human => print_human(&entry),

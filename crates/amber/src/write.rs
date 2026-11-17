@@ -24,7 +24,7 @@ pub struct WriteOptions {
     pub name: Option<String>,
 }
 
-fn guard(destination: &Path, options: &WriteOptions) -> Result<()> {
+pub(crate) fn guard(destination: &Path, options: &WriteOptions) -> Result<()> {
     if destination.exists() && !options.force {
         return Err(Error::DestinationExists(destination.display().to_string()));
     }
@@ -49,9 +49,9 @@ fn build(
     let result = (|| {
         seed(&staged)?;
         let existing =
-            u64::try_from(Project::open(&staged)?.len()).map_err(|_| Error::OffsetOverflow)?;
+            u64::try_from(Project::open_fast(&staged)?.len()).map_err(|_| Error::OffsetOverflow)?;
         let summary = apply(&staged, entries, existing)?;
-        let project = Project::open(&staged)?;
+        let project = Project::open_fast(&staged)?;
         if project.len() as u64 != summary.total_entries {
             return Err(Error::Malformed(format!(
                 "staged project decodes {} entries but {} were expected",
@@ -147,7 +147,7 @@ fn copy(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn staging_path(destination: &Path) -> PathBuf {
+pub(crate) fn staging_path(destination: &Path) -> PathBuf {
     let mut name = destination.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".staging-{}", std::process::id()));
     destination.with_file_name(name)

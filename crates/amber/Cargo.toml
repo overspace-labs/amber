@@ -6,8 +6,11 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
+brotli-decompressor.workspace = true
+flate2.workspace = true
 getrandom.workspace = true
 memchr.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -227,6 +227,25 @@ pub fn decode_comment(source: &FileSource, wrapper_offset: u64) -> Result<Commen
     Ok(comment)
 }
 
+/// Reads a text record written as a `TEXT_WRAPPER` pointing at a UTF-16BE text frame,
+/// the shape Burp uses for the method, IP, title, extension and cookie columns.
+pub fn decode_text_record(source: &FileSource, wrapper_offset: u64) -> Result<Option<String>> {
+    if wrapper_offset == 0 {
+        return Ok(None);
+    }
+    let Some(wrapper) = optional(source, wrapper_offset, &layout::TEXT_WRAPPER)? else {
+        return Ok(None);
+    };
+    Ok(source
+        .text_frame(wrapper[&0].unsigned, None)?
+        .map(|frame| frame.value))
+}
+
+/// Reads a whole raw message (request or response) into memory.
+pub fn message_bytes(source: &FileSource, message: &Message) -> Result<Vec<u8>> {
+    source.bytes(message.payload_offset, message.length)
+}
+
 pub fn row_at(source: &FileSource, offset: u64) -> Result<Option<crate::binary::ObjectRecord>> {
     Ok(schema::typed_at(source, offset)?.filter(|record| {
         record.type_id() == Some(layout::ROW_TYPE_ID) && record.matches(&layout::ROW)
@@ -292,6 +311,10 @@ pub fn decode_entry(
         service,
         request,
         response,
+        // Best effort: an IP record this decoder does not recognise must not cost the entry.
+        ip: decode_text_record(source, fields[&tag::IP].unsigned)
+            .ok()
+            .flatten(),
         status_code: status.into(),
         burp_mime_code: fields[&tag::MIME_CODE].into(),
         response_length: length.into(),

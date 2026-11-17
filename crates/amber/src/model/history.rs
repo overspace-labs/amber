@@ -222,6 +222,9 @@ pub struct HistoryEntry {
     pub service: Option<Service>,
     pub request: Message,
     pub response: Option<Message>,
+    /// Resolved server IP from the row's tag-4 text record, when Burp stored one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ip: Option<String>,
     pub status_code: RawField,
     pub burp_mime_code: RawField,
     pub response_length: RawField,
@@ -238,7 +241,7 @@ pub struct HistoryEntry {
 pub struct SourceInfo {
     pub path: String,
     pub bytes: u64,
-    pub sha256: String,
+    pub sha256: Option<String>,
     pub header_hex: String,
     pub header_match: bool,
 }
