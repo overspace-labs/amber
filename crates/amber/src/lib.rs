@@ -20,6 +20,6 @@ pub use dedupe::{DedupeMode, Deduper};
 pub use filter::{HistoryFilter, HostScope};
 pub use history::Project;
 pub use model::{HistoryEntry, HistoryInput};
-pub use search::{Matcher, Part, PartMatches, SearchOptions, search_entry};
+pub use search::{EntryMatches, Matcher, Part, PartMatches, SearchOptions, search_entry};
 pub use trim::{Decision, HostTally, TrimOptions, TrimSummary, trim};
 pub use write::{WriteOptions, WriteSummary, append, create};

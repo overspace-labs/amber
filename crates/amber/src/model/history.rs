@@ -29,7 +29,13 @@ pub fn highlight_name(code: u64) -> Option<String> {
     })
 }
 
+/// Colour name to Burp's highlight code. Also accepts `unknown:<code>` (what
+/// `highlight_name` produces for codes outside the known palette) so a code survives a
+/// read/write round trip unchanged.
 pub fn highlight_code(name: &str) -> Option<u64> {
+    if let Some(code) = name.strip_prefix("unknown:") {
+        return code.parse().ok().filter(|code| (1..=255).contains(code));
+    }
     HIGHLIGHTS
         .iter()
         .find(|(_, colour)| colour.eq_ignore_ascii_case(name))

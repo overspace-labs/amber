@@ -100,6 +100,15 @@ impl Project {
         filter: &HistoryFilter,
         mut visit: impl FnMut(HistoryEntry) -> Result<()>,
     ) -> Result<StreamSummary> {
+        self.for_each_until(filter, |entry| visit(entry).map(|()| true))
+    }
+
+    /// Like `for_each`, but `visit` returns `false` to stop before another row is decoded.
+    pub fn for_each_until(
+        &self,
+        filter: &HistoryFilter,
+        mut visit: impl FnMut(HistoryEntry) -> Result<bool>,
+    ) -> Result<StreamSummary> {
         let mut summary = StreamSummary {
             total: self.rows.len() as u64,
             complete: true,
@@ -124,7 +133,9 @@ impl Project {
                 continue;
             }
             summary.emitted += 1;
-            visit(entry)?;
+            if !visit(entry)? {
+                break;
+            }
         }
         Ok(summary)
     }

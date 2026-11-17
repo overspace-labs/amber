@@ -1,6 +1,6 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use amber::{Error, Result, TrimOptions, TrimSummary, trim};
 use clap::Args;
@@ -21,9 +21,14 @@ pub struct TrimCommand {
     /// Project name Burp shows; defaults to the output file stem.
     #[arg(short, long)]
     pub name: Option<String>,
-    /// Duplicate rule. Annotated entries (comment or highlight) are always kept.
+    /// Duplicate rule. Annotated entries (comment or highlight) are kept unless
+    /// --dedupe-annotated is given.
     #[arg(short, long, value_enum, default_value_t = DedupeArg::Session)]
     pub dedupe: DedupeArg,
+    /// Also drop duplicates that carry a comment or highlight (e.g. ones an extension
+    /// annotated automatically).
+    #[arg(long)]
+    pub dedupe_annotated: bool,
     /// Decide and report only; write no project.
     #[arg(long)]
     pub dry_run: bool,
@@ -48,6 +53,53 @@ fn create(path: &PathBuf, force: bool) -> Result<BufWriter<File>> {
         return Err(Error::DestinationExists(path.display().to_string()));
     }
     Ok(BufWriter::new(File::create(path)?))
+}
+
+/// True when two paths name the same file: same inode when both exist (catches symlinks
+/// and hard links), otherwise the same absolute path.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (fs::metadata(a), fs::metadata(b)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    if let (Ok(left), Ok(right)) = (fs::canonicalize(a), fs::canonicalize(b)) {
+        return left == right;
+    }
+    match (std::path::absolute(a), std::path::absolute(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => a == b,
+    }
+}
+
+/// Refuses sidecar paths that would clobber the source, the output or each other. Runs
+/// before any file is opened for writing.
+fn check_paths(command: &TrimCommand) -> Result<()> {
+    let mut named: Vec<(&str, &Path)> = vec![("source project", command.project.as_path())];
+    if let Some(output) = command.output.as_deref() {
+        if !command.dry_run {
+            named.push(("--output", output));
+        }
+    }
+    if let Some(manifest) = command.manifest.as_deref() {
+        named.push(("--manifest", manifest));
+    }
+    if let Some(summary) = command.summary.as_deref() {
+        named.push(("--summary", summary));
+    }
+    for (index, (left_name, left)) in named.iter().enumerate() {
+        for (right_name, right) in &named[index + 1..] {
+            if same_file(left, right) {
+                return Err(Error::Malformed(format!(
+                    "{right_name} {} is the same file as the {left_name}",
+                    right.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn report(summary: &TrimSummary, top: usize, dry_run: bool) {
@@ -88,10 +140,10 @@ fn report(summary: &TrimSummary, top: usize, dry_run: bool) {
             summary.kept_incomplete
         );
     }
-    if summary.dropped_highlights > 0 {
+    if summary.kept_ip_unreadable > 0 {
         eprintln!(
-            "note: {} unknown highlight colours were dropped",
-            summary.dropped_highlights
+            "note: {} kept entries had a server-IP record that could not be read; written without IP",
+            summary.kept_ip_unreadable
         );
     }
     let mut kept: Vec<_> = summary
@@ -130,12 +182,15 @@ fn report(summary: &TrimSummary, top: usize, dry_run: bool) {
         );
     }
     if let Some(verified) = summary.verified {
-        eprintln!("\nverified {verified} kept entries: request/response sha256 identical to source");
+        eprintln!(
+            "\nverified {verified} kept entries before publishing: request/response sha256 identical to source"
+        );
     }
 }
 
 impl TrimCommand {
     pub fn run(&self) -> Result<()> {
+        check_paths(self)?;
         let filter = self.filters.build()?;
         let mut manifest = match &self.manifest {
             Some(path) => Some(create(path, self.force)?),
@@ -153,6 +208,7 @@ impl TrimCommand {
             dedupe: self.dedupe.into(),
             dry_run: self.dry_run,
             verify: self.verify,
+            dedupe_annotated: self.dedupe_annotated,
         };
 
         let summary = trim(&self.project, &output, &filter, &options, |entry, decision| {

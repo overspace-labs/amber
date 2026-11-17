@@ -116,26 +116,43 @@ impl SearchCommand {
         }
         let mut hits = 0u64;
         let mut scanned = 0u64;
+        let mut capped_entries = 0u64;
         let mut stopped = false;
-        let summary = project.for_each(&filter, |entry| {
-            if stopped {
-                return Ok(());
-            }
+        let summary = project.for_each_until(&filter, |entry| {
             scanned += 1;
-            let found = search_entry(project.source(), &entry, &matcher, &options)?;
-            if found.is_empty() != self.negate {
-                return Ok(());
+            let result = search_entry(project.source(), &entry, &matcher, &options)?;
+            if !result.capped.is_empty() {
+                capped_entries += 1;
+            }
+            // A capped decode with no match is not proof of absence: a negative search
+            // still lists it, flagged, rather than silently treating it as clean.
+            if result.is_empty() != self.negate {
+                return Ok(true);
             }
             hits += 1;
             if self.limit.is_some_and(|limit| hits >= limit) {
                 stopped = true;
             }
+            let capped_note = if result.capped.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [decode capped: {}]",
+                    result
+                        .capped
+                        .iter()
+                        .map(|part| part.label())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            let found = &result.parts;
             let url = entry.request.url.as_deref().unwrap_or_default();
             let method = entry.request.method.as_deref().unwrap_or_default();
             let status = entry.status_code.unsigned;
 
             if self.only_matching {
-                for part in &found {
+                for part in found {
                     for (start, end) in &part.ranges {
                         match self.format {
                             Format::Table => writeln!(
@@ -160,7 +177,7 @@ impl SearchCommand {
                         }
                     }
                 }
-                return Ok(());
+                return Ok(!stopped);
             }
 
             match self.format {
@@ -178,14 +195,14 @@ impl SearchCommand {
                         .collect();
                     writeln!(
                         out,
-                        "{:>6}  {:<7}  {:>6}  {:<28}  {url}",
+                        "{:>6}  {:<7}  {:>6}  {:<28}  {url}{capped_note}",
                         entry.entry_id,
                         method,
                         status,
                         if self.negate { "-".to_owned() } else { labels.join(",") },
                     )?;
                     if let Some(context) = self.context {
-                        for part in &found {
+                        for part in found {
                             for (start, end) in &part.ranges {
                                 writeln!(
                                     out,
@@ -227,12 +244,13 @@ impl SearchCommand {
                             "time_epoch_ms": entry.time_epoch_ms.unsigned,
                             "comment": entry.comment.value,
                             "matches": parts_json,
+                            "decode_capped": result.capped,
                         }),
                     )?;
                     out.write_all(b"\n")?;
                 }
             }
-            Ok(())
+            Ok(!stopped)
         })?;
         out.flush()?;
         eprintln!(
@@ -240,6 +258,12 @@ impl SearchCommand {
             summary.total,
             if stopped { "; stopped at --limit" } else { "" }
         );
+        if capped_entries > 0 {
+            eprintln!(
+                "warning: {capped_entries} entries had a body larger than {} MiB after decoding; only the first part was searched",
+                amber::search::DECODE_LIMIT / (1024 * 1024)
+            );
+        }
         Ok(())
     }
 }

@@ -228,18 +228,29 @@ pub fn decode_comment(source: &FileSource, wrapper_offset: u64) -> Result<Commen
 }
 
 /// Reads a text record written as a `TEXT_WRAPPER` pointing at a UTF-16BE text frame,
-/// the shape Burp uses for the method, IP, title, extension and cookie columns.
-pub fn decode_text_record(source: &FileSource, wrapper_offset: u64) -> Result<Option<String>> {
+/// the shape Burp uses for the method, IP, title, extension and cookie columns. Frames
+/// declaring more than `max_units` UTF-16 units are refused before anything is allocated.
+pub fn decode_text_record(
+    source: &FileSource,
+    wrapper_offset: u64,
+    max_units: u32,
+) -> Result<Option<String>> {
     if wrapper_offset == 0 {
         return Ok(None);
     }
     let Some(wrapper) = optional(source, wrapper_offset, &layout::TEXT_WRAPPER)? else {
         return Ok(None);
     };
-    Ok(source
-        .text_frame(wrapper[&0].unsigned, None)?
-        .map(|frame| frame.value))
+    let frame = wrapper[&0].unsigned;
+    if frame.checked_add(8).is_none_or(|end| end > source.len()) || source.u32(frame + 4)? > max_units
+    {
+        return Ok(None);
+    }
+    Ok(source.text_frame(frame, None)?.map(|text| text.value))
 }
+
+/// Longest IP text record decoded (an IPv6 address with zone id fits comfortably).
+pub const MAX_IP_UNITS: u32 = 128;
 
 /// Reads a whole raw message (request or response) into memory.
 pub fn message_bytes(source: &FileSource, message: &Message) -> Result<Vec<u8>> {
@@ -312,7 +323,7 @@ pub fn decode_entry(
         request,
         response,
         // Best effort: an IP record this decoder does not recognise must not cost the entry.
-        ip: decode_text_record(source, fields[&tag::IP].unsigned)
+        ip: decode_text_record(source, fields[&tag::IP].unsigned, MAX_IP_UNITS)
             .ok()
             .flatten(),
         status_code: status.into(),

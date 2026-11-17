@@ -8,7 +8,6 @@ use serde::Serialize;
 
 use crate::binary::FileSource;
 use crate::diagnostic::{Error, Result};
-use crate::history::decode::message_bytes;
 use crate::model::history::{HistoryEntry, HttpHeader, Message};
 
 /// Cap on a decoded (decompressed) body, so a hostile or corrupt stream cannot exhaust RAM.
@@ -96,7 +95,31 @@ pub struct PartMatches {
     pub text: Vec<u8>,
     pub ranges: Vec<(usize, usize)>,
     pub decoded: bool,
+    /// More than `MATCH_LIMIT` matches; only the first ones are listed.
     pub truncated: bool,
+}
+
+/// Result of searching one entry.
+#[derive(Debug, Clone, Default)]
+pub struct EntryMatches {
+    /// Parts with at least one match.
+    pub parts: Vec<PartMatches>,
+    /// Parts whose decoded body exceeded `DECODE_LIMIT`: only the first `DECODE_LIMIT`
+    /// bytes were searched, so "no match" there is not conclusive.
+    pub capped: Vec<Part>,
+}
+
+impl EntryMatches {
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+}
+
+/// A decoded body, and whether it was cut at `DECODE_LIMIT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decoded {
+    pub data: Vec<u8>,
+    pub capped: bool,
 }
 
 fn header_value<'a>(headers: &'a [HttpHeader], name: &str) -> Option<&'a str> {
@@ -106,50 +129,67 @@ fn header_value<'a>(headers: &'a [HttpHeader], name: &str) -> Option<&'a str> {
         .map(|header| header.value.trim())
 }
 
-fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(body.len());
+/// Removes chunked framing. Output never exceeds `limit`; the flag reports a cut.
+fn dechunk(body: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
+    let mut out = Vec::new();
     let mut cursor = 0usize;
     loop {
-        let line_end = memchr::memmem::find(&body[cursor..], b"\r\n")? + cursor;
+        let line_end = memchr::memmem::find(body.get(cursor..)?, b"\r\n")? + cursor;
         let size_text = std::str::from_utf8(&body[cursor..line_end]).ok()?;
         let size_text = size_text.split(';').next()?.trim();
         let size = usize::from_str_radix(size_text, 16).ok()?;
         cursor = line_end + 2;
         if size == 0 {
-            return Some(out);
+            return Some((out, false));
         }
         let end = cursor.checked_add(size)?;
         if end > body.len() {
             return None;
         }
+        let room = limit - out.len();
+        if size > room {
+            out.extend_from_slice(&body[cursor..cursor + room]);
+            return Some((out, true));
+        }
         out.extend_from_slice(&body[cursor..end]);
         cursor = end + 2;
         if cursor > body.len() {
-            return Some(out);
+            return Some((out, false));
         }
     }
 }
 
-fn read_limited(reader: impl Read) -> Option<Vec<u8>> {
+/// Reads at most `limit` bytes, and reports whether the stream had more.
+fn read_limited(reader: impl Read, limit: usize) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::new();
-    reader.take(DECODE_LIMIT).read_to_end(&mut out).ok()?;
-    Some(out)
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    let capped = out.len() > limit;
+    out.truncate(limit);
+    Some((out, capped))
 }
 
-fn inflate(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
+fn inflate(encoding: &str, data: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
     match encoding {
-        "gzip" | "x-gzip" => read_limited(flate2::read::MultiGzDecoder::new(data)),
-        "deflate" => read_limited(flate2::read::ZlibDecoder::new(data))
-            .or_else(|| read_limited(flate2::read::DeflateDecoder::new(data))),
-        "br" => read_limited(brotli_decompressor::Decompressor::new(data, 64 * 1024)),
-        "identity" | "" => Some(data.to_vec()),
+        "gzip" | "x-gzip" => read_limited(flate2::read::MultiGzDecoder::new(data), limit),
+        "deflate" => read_limited(flate2::read::ZlibDecoder::new(data), limit)
+            .or_else(|| read_limited(flate2::read::DeflateDecoder::new(data), limit)),
+        "br" => read_limited(brotli_decompressor::Decompressor::new(data, 64 * 1024), limit),
+        "identity" => Some((data.to_vec(), false)),
         _ => None,
     }
 }
 
-/// Returns the body with transfer and content codings removed, or `None` when there was
-/// nothing to undo or decoding failed (the caller then searches the stored bytes).
-pub fn decode_body(headers: &[HttpHeader], body: &[u8]) -> Option<Vec<u8>> {
+/// Returns the body with transfer and content codings removed (each stage capped at
+/// `DECODE_LIMIT`), or `None` when there was nothing to undo or decoding failed (the
+/// caller then searches the stored bytes).
+pub fn decode_body(headers: &[HttpHeader], body: &[u8]) -> Option<Decoded> {
+    decode_body_limited(headers, body, usize::try_from(DECODE_LIMIT).unwrap_or(usize::MAX))
+}
+
+fn decode_body_limited(headers: &[HttpHeader], body: &[u8], limit: usize) -> Option<Decoded> {
     let chunked = header_value(headers, "transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
     let encodings: Vec<String> = header_value(headers, "content-encoding")
@@ -164,16 +204,22 @@ pub fn decode_body(headers: &[HttpHeader], body: &[u8]) -> Option<Vec<u8>> {
     if !chunked && encodings.is_empty() {
         return None;
     }
-    let mut data = if chunked {
-        dechunk(body).unwrap_or_else(|| body.to_vec())
+    let (mut data, mut capped) = if chunked {
+        dechunk(body, limit)?
     } else {
-        body.to_vec()
+        (body.to_vec(), false)
     };
-    // Codings are listed in the order they were applied, so undo them in reverse.
+    // Codings are listed in the order they were applied, so undo them in reverse. A
+    // stream cut by the cap cannot be decoded further reliably, so stop there.
     for coding in encodings.iter().rev() {
-        data = inflate(coding, &data)?;
+        if capped {
+            break;
+        }
+        let (next, cut) = inflate(coding, &data, limit)?;
+        data = next;
+        capped = cut;
     }
-    Some(data)
+    Some(Decoded { data, capped })
 }
 
 fn find(matcher: &Matcher, text: &[u8], group: Option<usize>) -> (Vec<(usize, usize)>, bool) {
@@ -201,31 +247,32 @@ fn find(matcher: &Matcher, text: &[u8], group: Option<usize>) -> (Vec<(usize, us
     (ranges, false)
 }
 
-fn split(source: &FileSource, message: &Message) -> Result<(Vec<u8>, Vec<u8>)> {
-    let mut bytes = message_bytes(source, message)?;
-    let head = usize::try_from(message.body_offset - message.payload_offset)
-        .map_err(|_| Error::OffsetOverflow)?
-        .min(bytes.len());
-    let body = bytes.split_off(head);
-    Ok((bytes, body))
+/// Byte range of one part of a message within the project file.
+fn range(message: &Message, part: Part) -> (u64, u64) {
+    if part.is_headers() {
+        (
+            message.payload_offset,
+            message.body_offset - message.payload_offset,
+        )
+    } else {
+        (message.body_offset, message.body_length)
+    }
 }
 
-/// Searches the requested parts of `entry`, returning only parts with at least one match.
+/// Searches the requested parts of `entry`. Only the requested parts are read, each one
+/// separately, so a header search never loads a large body.
 pub fn search_entry(
     source: &FileSource,
     entry: &HistoryEntry,
     matcher: &Matcher,
     options: &SearchOptions,
-) -> Result<Vec<PartMatches>> {
+) -> Result<EntryMatches> {
     let parts: &[Part] = if options.parts.is_empty() {
         &Part::ALL
     } else {
         &options.parts
     };
-    let mut found = Vec::new();
-    let mut request: Option<(Vec<u8>, Vec<u8>)> = None;
-    let mut response: Option<(Vec<u8>, Vec<u8>)> = None;
-
+    let mut result = EntryMatches::default();
     for part in parts {
         let message = if part.is_request() {
             Some(&entry.request)
@@ -235,30 +282,24 @@ pub fn search_entry(
         let Some(message) = message else {
             continue;
         };
-        let cache = if part.is_request() {
-            &mut request
-        } else {
-            &mut response
-        };
-        if cache.is_none() {
-            *cache = Some(split(source, message)?);
-        }
-        let Some((headers, body)) = cache.as_ref() else {
-            continue;
-        };
-        let (text, decoded) = if part.is_headers() {
-            (headers.clone(), false)
-        } else if options.decode {
-            match decode_body(&message.headers, body) {
-                Some(decoded) => (decoded, true),
-                None => (body.clone(), false),
+        let (offset, length) = range(message, *part);
+        let raw = source.bytes(offset, length)?;
+        let (text, decoded) = if options.decode && !part.is_headers() {
+            match decode_body(&message.headers, &raw) {
+                Some(decoded) => {
+                    if decoded.capped {
+                        result.capped.push(*part);
+                    }
+                    (decoded.data, true)
+                }
+                None => (raw, false),
             }
         } else {
-            (body.clone(), false)
+            (raw, false)
         };
         let (ranges, truncated) = find(matcher, &text, options.group);
         if !ranges.is_empty() {
-            found.push(PartMatches {
+            result.parts.push(PartMatches {
                 part: *part,
                 text,
                 ranges,
@@ -267,7 +308,7 @@ pub fn search_entry(
             });
         }
     }
-    Ok(found)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -314,9 +355,34 @@ mod tests {
             header("Content-Encoding", "gzip"),
         ];
         assert_eq!(
-            decode_body(&headers, &chunked).as_deref(),
-            Some(&b"hello secret world"[..])
+            decode_body(&headers, &chunked),
+            Some(Decoded {
+                data: b"hello secret world".to_vec(),
+                capped: false
+            })
         );
+    }
+
+    #[test]
+    fn decode_cap_is_reported_not_silent() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&[b'a'; 4096]).unwrap();
+        let gz = encoder.finish().unwrap();
+        let headers = [header("Content-Encoding", "gzip")];
+        let decoded = decode_body_limited(&headers, &gz, 1000).unwrap();
+        assert!(decoded.capped);
+        assert_eq!(decoded.data.len(), 1000);
+        let exact = decode_body_limited(&headers, &gz, 4096).unwrap();
+        assert!(!exact.capped);
+    }
+
+    #[test]
+    fn dechunk_respects_the_cap() {
+        let body = b"a\r\n0123456789\r\n5\r\nabcde\r\n0\r\n\r\n";
+        assert_eq!(dechunk(body, 100), Some((b"0123456789abcde".to_vec(), false)));
+        assert_eq!(dechunk(body, 12), Some((b"0123456789ab".to_vec(), true)));
+        assert_eq!(dechunk(b"zz\r\n", 10), None);
     }
 
     #[test]

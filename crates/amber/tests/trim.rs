@@ -56,7 +56,7 @@ fn trim_keeps_scope_drops_duplicates_and_preserves_bytes() {
     let mut annotated = entry(4, "app.example.com", &api("A"), Some(API_OK));
     annotated.comment = "keep me".to_owned();
     let mut highlighted = entry(9, "app.example.com", &api("A"), Some(API_OK));
-    highlighted.highlight = Some("red".to_owned());
+    highlighted.highlight = Some("unknown:12".to_owned()); // outside the named palette
     let entries = vec![
         entry(1, "app.example.com", &api("A"), Some(API_OK)),
         entry(2, "app.example.com", &api("A"), Some(API_OK)), // duplicate of 1
@@ -148,6 +148,7 @@ fn trim_keeps_scope_drops_duplicates_and_preserves_bytes() {
     .unwrap();
     assert!(http2.starts_with(b"POST /api/items HTTP/2\r\n"));
     assert_eq!(trimmed.entry(1).unwrap().ip.as_deref(), Some("192.0.2.10"));
+    assert_eq!(trimmed.entry(9).unwrap().highlight.code, 12);
 
     // Refuses to overwrite, and refuses to trim a project onto itself.
     assert!(trim(&source, &output, &filter, &options, |_, _| Ok(())).is_err());
@@ -179,6 +180,31 @@ fn dry_run_writes_nothing_and_modes_differ() {
     assert_eq!(count(DedupeMode::Session), 0);
     assert_eq!(count(DedupeMode::Any), 1);
     assert_eq!(count(DedupeMode::Endpoint), 2);
+    assert!(!output.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_staging_path_is_never_truncated() {
+    let dir = scratch("staging");
+    let source = dir.join("source.burp");
+    create(
+        &source,
+        &[entry(1, "app.example.com", &api("A"), Some(API_OK))],
+        &WriteOptions::default(),
+    )
+    .unwrap();
+    let before = std::fs::read(&source).unwrap();
+    let output = dir.join("out.burp");
+    // Plant the exact staging name this process would use, aliasing the source.
+    let staged = dir.join(format!("out.burp.staging-{}", std::process::id()));
+    std::os::unix::fs::symlink(&source, &staged).unwrap();
+
+    let result = trim(&source, &output, &HistoryFilter::default(), &TrimOptions::default(), |_, _| Ok(()));
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), before, "source must be untouched");
+    assert!(std::fs::symlink_metadata(&staged).is_ok(), "planted path must not be removed");
     assert!(!output.exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
