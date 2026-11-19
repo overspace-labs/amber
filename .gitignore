@@ -1,4 +1,17 @@
 .DS_Store
 /target
 Cross.toml
-Cargo.lock
+
+# Captured traffic (cookies, tokens): Burp projects, export output, and the staging and
+# manifest files amber writes next to them.
+*.burp
+*.staging-*
+/out/
+*.manifest.jsonl
+
+# Secrets and local IDE settings.
+.env
+*.pem
+*.key
+.idea/
+.vscode/

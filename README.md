@@ -42,7 +42,7 @@ Both `list` and `export` take the same filters, all optional and combinable:
 | `-l, --highlight` | `red`, `orange`, `yellow`, `green`, `cyan`, `blue`, `pink`, `magenta`, `gray`, or `none` |
 
 `export` writes `out/history.json` plus one `out/blobs/` sidecar per raw message. Pass
-`-n, --no-blobs` to skip the sidecars.
+`-n, --no-blobs` to skip the sidecars, and `-p, --progress` for a progress summary on stderr.
 
 ## Writing
 
@@ -53,8 +53,10 @@ amber append project.burp input.json -o bigger.burp       # source project is ne
 ```
 
 Input documents look like this. `request` and `response` are either `{"path": "..."}` pointing
-at a file of raw bytes, or `{"base64": "..."}` inline. Everything except `url` and `request`
-is optional, and `defaults` supplies values for entries that omit them.
+at a file of raw bytes, or `{"base64": "..."}` inline. A relative `path` is resolved against the
+input document's directory. A `path` entry may also carry `length` and `sha256`; when present they
+are checked against the file, and the write fails if either differs. Everything except `url` and
+`request` is optional, and `defaults` supplies values for entries that omit them.
 
 Per-entry optional fields: `entry_id` (otherwise auto-assigned), `time_epoch_ms`,
 `listener_port`, `comment`, `highlight`, and `ip` — the resolved target server IP, written
@@ -133,6 +135,9 @@ amber show project.burp 1234 --raw response > resp.bin     # the raw message, li
 (prefix, length, sha256 fingerprint), so the same token can be tracked across entries without
 being revealed. It cannot be combined with `--context`.
 
+`-g, --group N` reports regex capture group N instead of the whole match, so use it with `-r` and a
+pattern that has a `(...)` group.
+
 `-d, --decode` undoes chunked transfer coding and gzip/deflate/br before matching (Burp's search
 matches the stored bytes, so it is off by default). `-F jsonl` gives one JSON object per entry
 with match samples; `-n` stops after N matching entries.
@@ -144,6 +149,8 @@ amber hosts project.burp                                  # entries, duplicates 
 amber hosts project.burp --scope-file scope.txt -F jsonl
 ```
 
+`-d, --dedupe` sets the rule behind the DUPS column (default `session`, the same modes as `trim`).
+
 ### Trim
 
 ```sh
@@ -154,13 +161,16 @@ amber trim project.burp --scope-file scope.txt -o trimmed.burp --manifest trimme
 Writes a **new** project holding only the Proxy history entries that pass the filters and are not
 duplicates. The source is opened read-only. Requests and responses are copied byte for byte (an
 `HTTP/2` request line stays `HTTP/2`), together with the original entry ID, time, listener port,
-comment, highlight and server IP. Entries go in one at a time, so memory use does not grow
-with project size. `--verify` re-reads the output and compares every kept message's sha256 with
-the source. The manifest has one JSON line per source entry: `kept`, `filtered`,
-`duplicate` (with `of`, the kept entry it repeats) or `unwritable` (with `reason`).
+comment, highlight and server IP. Entries are read and copied one at a time, so message bytes never
+pile up in memory. Per-entry bookkeeping (row index, dedupe key, verify digest) is a few dozen bytes
+per entry, so it grows with the number of entries, not with message size. `--verify` re-reads the
+output and compares every kept message's sha256 with the source. The manifest has one JSON line per
+source entry: `kept`, `filtered`, `duplicate` (with `of`, the kept entry it repeats) or `unwritable`
+(with `reason`).
 
-`--dedupe` (default `session`). Entries with a comment or highlight are always kept, and the
-lowest entry ID of a group is the one kept.
+`--dedupe` (default `session`). Entries with a comment or highlight are kept even when they repeat
+an earlier entry; `--dedupe-annotated` drops those duplicates too. In each group of duplicates the
+lowest entry ID is the one kept.
 
 | mode | an entry is a duplicate of an earlier one when these are identical |
 | --- | --- |
@@ -172,11 +182,23 @@ lowest entry ID of a group is the one kept.
 Caller identity is made of two things:
 - **The `Authorization` value.** For OCI request signing (`Signature ... keyId=`), only the key id
   counts.
-- **The cookies, sorted.** Analytics and bot-management cookies (`_ga*`, `s_*`, `AMCV_*`, `bm_*`,
-  `_abck`, ...) are left out.
+- **The cookies, sorted.** Analytics, consent and bot-management cookies are left out by exact
+  name, case-insensitively (for example `_ga`, `s_cc`, `bm_sv`, `_abck`, `optanonconsent`), plus
+  two generated shapes: `_ga_<id>` and `amcv_<org>@adobeorg`. Matching is deliberately literal:
+  `s_session` and `_gateway_session` still count as identity.
 
 Static assets (script, style, image, font, source map, judged by `Content-Type` or extension)
 leave identity out.
 
 The new project contains **Proxy history only**. Repeater, Site map, Scanner issues, Logger,
 Organizer and project settings stay in the original. Keep the original as the archive.
+
+Other `trim` options:
+
+| flag | does |
+| --- | --- |
+| `-n, --name NAME` | project name Burp shows (default: the output file name without its extension) |
+| `-f, --force` | overwrite `--output`, `--manifest` or `--summary` if they exist |
+| `--dedupe-annotated` | also drop duplicates that carry a comment or highlight |
+| `--summary FILE` | write the run totals and per-host tallies as JSON |
+| `--top N` | number of dropped hosts listed in the report (default 25) |
